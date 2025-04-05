@@ -12,7 +12,7 @@ from .helper import filter_none, format_image_prompt
 from .base_provider import AsyncGeneratorProvider, ProviderModelMixin
 from ..typing import AsyncResult, Messages, MediaListType
 from ..image import is_data_an_audio
-from ..errors import ModelNotFoundError
+from ..errors import ModelNotFoundError, ResponseError
 from ..requests.raise_for_status import raise_for_status
 from ..requests.aiohttp import get_connector
 from ..image.copy_images import save_response_media
@@ -48,8 +48,8 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
     default_vision_model = default_model
     text_models = [default_model]
     image_models = [default_image_model]
-    extra_image_models = ["flux-pro", "flux-dev", "flux-schnell", "midjourney", "dall-e-3"]
-    vision_models = [default_vision_model, "gpt-4o-mini", "o3-mini", "openai", "openai-large"]
+    extra_image_models = ["flux-pro", "flux-dev", "flux-schnell", "midjourney", "dall-e-3", "turbo"]
+    vision_models = [default_vision_model, "gpt-4o-mini", "o3-mini", "openai", "openai-large", "searchgpt"]
     extra_text_models = vision_models
     _models_loaded = False
     model_aliases = {
@@ -68,7 +68,7 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
         "gemini-2.0": "gemini",
         "gemini-2.0-flash": "gemini",
         "gemini-2.0-flash-thinking": "gemini-thinking",
-        "deepseek-r1": "deepseek-r1-llama",
+        "deepseek-r1": "deepseek-reasoning-large",
         "gpt-4o-audio": "openai-audio",
         
         ### Image Models ###
@@ -101,7 +101,7 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
                 original_text_models = [
                     model.get("name") 
                     for model in models
-                    if model.get("type") == "chat"
+                    if "text"in model.get("output_modalities")
                 ]
                 cls.audio_models = {
                     model.get("name"): model.get("voices")
@@ -113,10 +113,8 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
                 combined_text = (
                     cls.text_models +  # Already contains the default
                     cls.extra_text_models + 
-                    [
-                        model for model in original_text_models
-                        if model not in cls.extra_text_models
-                    ]
+                    original_text_models +
+                    cls.vision_models
                 )
                 cls.text_models = list(dict.fromkeys(combined_text))
                 
@@ -155,7 +153,7 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
         media: MediaListType = None,
         temperature: float = None,
         presence_penalty: float = None,
-        top_p: float = 1,
+        top_p: float = None,
         frequency_penalty: float = None,
         response_format: Optional[dict] = None,
         extra_parameters: list[str] = ["tools", "parallel_tool_calls", "tool_choice", "reasoning_effort", "logit_bias", "voice", "modalities", "audio"],
@@ -281,7 +279,7 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
         **kwargs
     ) -> AsyncResult:
         if not cache and seed is None:
-            seed = random.randint(9999, 99999999)
+            seed = random.randint(0, 2**32)
         json_mode = False
         if response_format and response_format.get("type") == "json_object":
             json_mode = True
@@ -320,31 +318,30 @@ class PollinationsAI(AsyncGeneratorProvider, ProviderModelMixin):
                             if line[6:].startswith(b"[DONE]"):
                                 break
                             result = json.loads(line[6:])
+                            if "usage" in result:
+                                yield Usage(**result["usage"])
                             choices = result.get("choices", [{}])
                             choice = choices.pop() if choices else {}
                             content = choice.get("delta", {}).get("content")
                             if content:
                                 yield content
-                            if "usage" in result:
-                                yield Usage(**result["usage"])
                             finish_reason = choice.get("finish_reason")
                             if finish_reason:
                                 yield FinishReason(finish_reason)
                     return
                 result = await response.json()
-                choice = result["choices"][0]
-                message = choice.get("message", {})
-                content = message.get("content", "")
-
-                if "tool_calls" in message:
-                    yield ToolCalls(message["tool_calls"])
-
-                if content:
-                    yield content
-
+                if "choices" in result:
+                    choice = result["choices"][0]
+                    message = choice.get("message", {})
+                    content = message.get("content", "")
+                    if content:
+                        yield content
+                    if "tool_calls" in message:
+                        yield ToolCalls(message["tool_calls"])
+                else:
+                    raise ResponseError(result)
                 if "usage" in result:
                     yield Usage(**result["usage"])
-
                 finish_reason = choice.get("finish_reason")
                 if finish_reason:
                     yield FinishReason(finish_reason)
